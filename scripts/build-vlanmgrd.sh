@@ -58,17 +58,21 @@ echo "=== vlanmgrd: pre-flight checks ==="
 check_container_running "$BUILD_CT"
 check_container_running "$VS_CT"
 
-if [ ! -f "$BINARY_HOST_PATH" ]; then
-    echo "ERROR: Binary not found at '$BINARY_HOST_PATH'." >&2
-    echo "  Compile it first inside the build container:" >&2
-    echo "    docker exec $BUILD_CT make -C $SWSS_SRC/cfgmgr vlanmgrd -j\$(nproc)" >&2
-    exit 1
-fi
-
 echo "  Build image root : $SONIC_ROOT"
 echo "  Build container  : $BUILD_CT"
 echo "  Target container : $VS_CT"
-echo "  Binary           : $BINARY_HOST_PATH"
+echo "  Source           : $SWSS_SRC/cfgmgr"
+
+# --- Compile ----------------------------------------------------------------
+echo "=== vlanmgrd: compiling ==="
+docker exec "$BUILD_CT" make -C "$SWSS_SRC/cfgmgr" vlanmgrd -j"$(nproc)"
+
+if [ ! -f "$BINARY_HOST_PATH" ]; then
+    echo "ERROR: Build succeeded but binary not found at '$BINARY_HOST_PATH'." >&2
+    exit 1
+fi
+
+echo "  Binary built: $BINARY_HOST_PATH"
 
 # --- Deploy ----------------------------------------------------------------
 echo "=== vlanmgrd: deploying ==="
@@ -78,10 +82,5 @@ echo "  Copied to $VS_CT:$BINARY_DEST"
 
 docker exec "$VS_CT" supervisorctl restart vlanmgrd
 echo "  vlanmgrd restarted"
-
-# --- Verify ----------------------------------------------------------------
-sleep 1
-echo "=== vlanmgrd: verifying ==="
-docker exec "$VS_CT" grep "Mahmut claude agent" /var/log/syslog | tail -1 || echo "  (no matching log line found — this may be fine on first deploy)"
 
 echo "=== vlanmgrd: done ==="
