@@ -1,87 +1,104 @@
 #!/bin/bash
-# build-stp.sh — Build stpd and deploy to sonic-vs container
+# build-stp.sh — Build stpd + stpmgrd and deploy to sonic-vs container
 #
-# Linux-only (requires Docker and a SONiC build environment).
+# Builds the STP submodule components:
+#   - stpd    (src/sonic-stp)          — STP daemon
+#   - stpmgrd (src/sonic-swss/cfgmgr)  — STP configuration manager
 #
-# Required environment:
-#   The following are auto-detected but can be overridden via env vars:
-#     SONIC_BUILDIMAGE_ROOT  — path to the sonic-buildimage repo on the host
-#     SONIC_BUILD_CONTAINER  — name of the sonic-slave/build container (default: sonic-build)
-#     SONIC_VS_CONTAINER     — name of the sonic-vs target container (default: sonic-vs)
+# Usage:
+#   ./build-stp.sh              # build + deploy + restart
+#   ./build-stp.sh -h           # show help
 #
-# Prerequisites:
-#   - Docker installed and accessible (user in 'docker' group, daemon running)
-#   - sonic-build container running with host source mounted at /sonic
-#   - sonic-vs container running
-#   - stpd already compiled inside the build container
+# Environment variables (all optional):
+#   SONIC_BUILDIMAGE_ROOT  — path to sonic-buildimage repo on host
+#   SONIC_BUILD_CONTAINER  — name of sonic-slave container (default: auto-detect)
+#   SONIC_VS_CONTAINER     — name of sonic-vs container (default: sonic-vs)
 
-set -euo pipefail
+set -uo pipefail
 
-# ---------------------------------------------------------------------------
-# Dependency checks
-# ---------------------------------------------------------------------------
-check_cmd() {
-    if ! command -v "$1" &>/dev/null; then
-        echo "ERROR: '$1' not found. Please install it first." >&2
-        exit 1
-    fi
-}
+SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
+source "$SCRIPT_DIR/lib/container-detect.sh"
 
-check_container_running() {
-    local name="$1"
-    if ! docker ps --format '{{.Names}}' 2>/dev/null | grep -qx "$name"; then
-        echo "ERROR: Container '$name' is not running." >&2
-        echo "  Start it or set the correct name via environment variable." >&2
-        exit 1
-    fi
-}
+# --- Help ----------------------------------------------------------------
+if [[ "${1:-}" == "-h" || "${1:-}" == "--help" ]]; then
+    echo "Usage: $0"
+    echo ""
+    echo "  Builds stpd and stpmgrd inside the sonic-slave container,"
+    echo "  copies the binaries into sonic-vs, and restarts both services."
+    echo ""
+    echo "  Environment:"
+    echo "    SONIC_BUILDIMAGE_ROOT   path to sonic-buildimage (default: auto-detect)"
+    echo "    SONIC_BUILD_CONTAINER   build container name (default: auto-detect)"
+    echo "    SONIC_VS_CONTAINER      target container name (default: sonic-vs)"
+    exit 0
+fi
 
 check_cmd docker
 
-# --- Resolve paths and container names ------------------------------------
-SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
+# --- Resolve paths -------------------------------------------------------
 SONIC_DEV_LAB="$(dirname "$SCRIPT_DIR")"
 SONIC_ROOT="${SONIC_BUILDIMAGE_ROOT:-$(dirname "$SONIC_DEV_LAB")/sonic-buildimage}"
-
-BUILD_CT="${SONIC_BUILD_CONTAINER:-sonic-build}"
 VS_CT="${SONIC_VS_CONTAINER:-sonic-vs}"
 
-# Container-internal source/build path (convention inside sonic-slave)
-STP_SRC="/sonic/src/sonic-stp"
-BINARY_NAME="stpd"
-BINARY_HOST_PATH="$SONIC_ROOT/src/sonic-stp/$BINARY_NAME"
-BINARY_DEST="/usr/bin/$BINARY_NAME"
-
-# --- Verify everything exists ---------------------------------------------
-echo "=== stpd: pre-flight checks ==="
-
-check_container_running "$BUILD_CT"
+# --- Ensure containers are running ---------------------------------------
+echo "=== stp: pre-flight checks ==="
+BUILD_CT="$(ensure_build_container "$SONIC_ROOT")"
 check_container_running "$VS_CT"
 
 echo "  Build image root : $SONIC_ROOT"
 echo "  Build container  : $BUILD_CT"
 echo "  Target container : $VS_CT"
-echo "  Source           : $STP_SRC"
 
-# --- Compile ----------------------------------------------------------------
-echo "=== stpd: compiling ==="
-docker exec "$BUILD_CT" make -C "$STP_SRC" -j"$(nproc)"
+# --- Compile stpd (src/sonic-stp) ----------------------------------------
+STP_SRC="/sonic/src/sonic-stp"
+STPD_BIN="stpd"
+STPD_HOST="$SONIC_ROOT/src/sonic-stp/$STPD_BIN"
+STPD_DEST="/usr/bin/$STPD_BIN"
 
-if [ ! -f "$BINARY_HOST_PATH" ]; then
-    echo "ERROR: Build succeeded but binary not found at '$BINARY_HOST_PATH'." >&2
+echo ""
+echo "=== stp: compiling stpd ==="
+docker exec "$BUILD_CT" make -C "$STP_SRC" stpd -j"$(nproc)"
+
+if [ ! -f "$STPD_HOST" ]; then
+    echo "ERROR: Build succeeded but stpd binary not found at '$STPD_HOST'." >&2
     exit 1
 fi
+echo "  stpd binary: $STPD_HOST"
 
-echo "  Binary built: $BINARY_HOST_PATH"
+# --- Compile stpmgrd (src/sonic-swss/cfgmgr) -----------------------------
+SWSS_SRC="/sonic/src/sonic-swss"
+STPMGRD_BIN="stpmgrd"
+STPMGRD_HOST="$SONIC_ROOT/src/sonic-swss/cfgmgr/$STPMGRD_BIN"
+STPMGRD_DEST="/usr/bin/$STPMGRD_BIN"
+
+echo ""
+echo "=== stp: compiling stpmgrd ==="
+docker exec "$BUILD_CT" make -C "$SWSS_SRC/cfgmgr" stpmgrd -j"$(nproc)"
+
+if [ ! -f "$STPMGRD_HOST" ]; then
+    echo "ERROR: Build succeeded but stpmgrd binary not found at '$STPMGRD_HOST'." >&2
+    exit 1
+fi
+echo "  stpmgrd binary: $STPMGRD_HOST"
 
 # --- Deploy ----------------------------------------------------------------
-echo "=== stpd: deploying ==="
+echo ""
+echo "=== stp: deploying ==="
 
-docker cp "$BINARY_HOST_PATH" "$VS_CT:$BINARY_DEST"
-echo "  Copied to $VS_CT:$BINARY_DEST"
+docker cp "$STPD_HOST" "$VS_CT:$STPD_DEST"
+echo "  Copied stpd to $VS_CT:$STPD_DEST"
 
-# stpd runs standalone (not via supervisor), so kill old + restart
+docker cp "$STPMGRD_HOST" "$VS_CT:$STPMGRD_DEST"
+echo "  Copied stpmgrd to $VS_CT:$STPMGRD_DEST"
+
+# --- Restart ---------------------------------------------------------------
+# stpd is NOT managed by supervisor — kill old process and start new
 docker exec "$VS_CT" bash -c 'kill $(pgrep -x stpd) 2>/dev/null || true; sleep 1; nohup /usr/bin/stpd > /dev/null 2>&1 &'
-echo "  stpd restarted"
+echo "  stpd restarted (standalone)"
 
-echo "=== stpd: done ==="
+# stpmgrd IS managed by supervisor
+docker exec "$VS_CT" supervisorctl restart stpmgrd
+echo "  stpmgrd restarted (supervisor)"
+
+echo ""
+echo "=== stp: done ==="
